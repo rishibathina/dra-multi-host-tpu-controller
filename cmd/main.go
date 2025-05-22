@@ -299,6 +299,7 @@ func createInitialClusterResourceSlice(ctx context.Context, k8sClient client.Cli
 		return nil, fmt.Errorf("unable to create initial ResourceSlice: %w", err)
 	}
 
+
 	fmt.Printf("Successfully created ResourceSlice '%s'\n", subsliceResourceSlice.Name)
 
 	return aggregatedTPUDevices, nil
