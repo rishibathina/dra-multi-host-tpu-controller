@@ -229,7 +229,6 @@ func createInitialClusterResourceSlice(ctx context.Context, k8sClient client.Cli
 
 	// need to figure out what to do when node devices dont exist
 	// if deviceCount == 0 {
-		
 	// }
 
 	devicesForPool := []resource.Device{}
