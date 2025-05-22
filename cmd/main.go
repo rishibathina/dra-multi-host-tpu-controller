@@ -28,11 +28,13 @@ import (
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+	k8sresource "k8s.io/apimachinery/pkg/api/resource"
 	corev1 "k8s.io/api/core/v1"
 	resource "k8s.io/api/resource/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"k8s.io/utils/ptr"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -210,7 +212,6 @@ func createInitialClusterResourceSlice(ctx context.Context, k8sClient client.Cli
 			if _, isSubsliceLabel := util.SubsliceTPULabelsSet[labelKey]; isSubsliceLabel {
 				combinedKey := labelKey + ":" + labelValue
 				if nodeSet, exists := aggregatedTPUDevices.Load(combinedKey); exists {
-					//nodeSet = append(nodeSet.([]string), node.Name)
 					if _, nodeExists := nodeSet.(*sync.Map).Load(node.Name); !nodeExists {
 						nodeSet.Store(node.Name, true)
 					} else {
@@ -232,7 +233,43 @@ func createInitialClusterResourceSlice(ctx context.Context, k8sClient client.Cli
 	// }
 
 	devicesForPool := []resource.Device{}
-	allNodeNamesForSharedCapacity := make(map[string]struct{})
+	countersForSharedCapacity := map[string]resource.Counter
+
+	aggregatedTPUDevices.Range(func(key, value interface{}) bool {
+		combinedKeyForNodeSelector := key.(string)
+		parts := strings.SplitN(combinedKeyForNodeSelector, ":", 2)
+		labelKeyForSelector := ""
+		labelValueForSelector := ""
+		if len(parts) == 2 {
+			labelKeyForSelector = parts[0]
+			labelValueForSelector = parts[1]
+		}
+
+		if labelKeyForSelector == "" || !util.SubsliceTPULabelsSet[labelKeyForSelector] {
+			setupLog.Error(fmt.Errorf("invalid or unrecognized label key for NodeSelector: '%s' from combined key '%s'", labelKeyForSelector, combinedKeyForNodeSelector), "Skipping device entry for this key")
+			return true 
+		}
+
+		nodesWithThisDeviceTypeMap := value.(*sync.Map)
+		nodesWithThisDeviceTypeMap.Range(func(nodeNameKey, _ interface{}) bool {
+			nodeName := nodeNameKey.(string)
+			devicesForPool = append(devicesForPool, resource.Device{
+				Name: nodeName,
+				Basic: &resource.BasicDevice{
+					NodeSelector: &corev1.NodeSelector{
+						MatchLabels: map[string]string{
+							labelKeyForSelector: labelValueForSelector,
+						},
+					},
+				}
+			})
+			countersForSharedCapacity[nodeName] = resource.Counter{
+				Value: k8sresource.NewQuantity(1, k8sresource.DecimalSI),
+			}
+			return true 
+		})
+		return true
+	})
 
 	subsliceResourceSlice := &resource.ResourceSlice{
 		ObjectMeta: metav1.ObjectMeta{
@@ -244,16 +281,25 @@ func createInitialClusterResourceSlice(ctx context.Context, k8sClient client.Cli
 				Generation: 1,
 				ResourceSliceCount: 1,
 			}
-			Driver: ControllerDriver,
-			PerDeviceNodeSelection: true,
+			Driver: ControllerDriverName,
+			PerDeviceNodeSelection: ptr.To(true),
 			SharedCounters: []resource.CounterSet{
-				Name: "slice-counter-set",
-				Counters: // map from name of nodes to counter struct with value 1, populated before
-			},
-			Devices: []resource.Device{ // list of devices, popoulated before
-
+				{
+					Name: "slice-counter-set",
+					Counters: countersForSharedCapacity,
+				},
 			}
+			Devices: devicesForPool,
+		}
 	}
+	if err := k8sClient.Create(ctx, subsliceResourceSlice, metav1.CreateOptions{}); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return aggregatedTPUDevices, nil
+		}
+		return nil, fmt.Errorf("unable to create initial ResourceSlice: %w", err)
+	}
+
+	fmt.Printf("Successfully created ResourceSlice '%s'\n", subsliceResourceSlice.Name)
 
 	return aggregatedTPUDevices, nil
 }

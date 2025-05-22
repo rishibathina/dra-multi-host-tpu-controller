@@ -69,8 +69,8 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if r.TPUNodesMap == nil {
-		r.TPUNodesMap = &sync.Map{}
+	if r.TPUDevicesMap == nil {
+		r.TPUDevicesMap = &sync.Map{}
 		log.Log.Info("TPUDevicesMap was nil in NodeReconciler.SetupWithManager, initialized to empty sync.Map")
 	}
 
