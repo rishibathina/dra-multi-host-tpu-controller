@@ -17,24 +17,35 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
+	"strconv"
+	"strings"
+	"sync"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+	corev1 "k8s.io/api/core/v1"
+	resource "k8s.io/api/resource/v1beta1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	"github.com/rishibathina/dra-controller/internal/util"
 	"github.com/rishibathina/dra-controller/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
@@ -44,9 +55,14 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
+const (
+	ControllerDriverName         = "tpu.google.com"
+	ClusterResourceSliceName     = "subslice-tpu-resources"
+)
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-
+	utilruntime.Must(resource.AddToScheme(scheme)) 
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -142,9 +158,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	setupLog.Info("Attempting to create initial Subslice ResourceSlice")
+	initialTPUMap, errCreateInitialSlice := createInitialClusterResourceSlice(context.Background(), mgr.GetClient())
+	if errCreateInitialSlice != nil {
+		setupLog.Error(errCreateInitialSlice, "failed to create initial Subslice ResourceSlice, reconciler will attempt later")
+	}
+	
+	if initialTPUMap == nil { 
+		setupLog.Info("No initial devices found")
+		initialTPUMap = &sync.Map{}
+	}
+
 	if err = (&controller.NodeReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		TPUDevicesMap: initialTPUMap, 
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Node")
 		os.Exit(1)
@@ -165,4 +193,67 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func createInitialClusterResourceSlice(ctx context.Context, k8sClient client.Client) (*sync.Map, error) {
+	nodeList := &corev1.NodeList{}
+	if err := k8sClient.List(ctx, nodeList); err != nil {
+		return nil, fmt.Errorf("unable to list nodes for initial ResourceSlice creation: %w", err)
+	}
+
+	// map from label + hash to set of nodes
+	// value is a sync map with key node name and sm bool as val
+	aggregatedTPUDevices := &sync.Map{}
+	deviceCount := 0
+	for _, node := range nodeList.Items {
+		for labelKey, labelValue := range node.Labels {
+			if _, isSubsliceLabel := util.SubsliceTPULabelsSet[labelKey]; isSubsliceLabel {
+				combinedKey := labelKey + ":" + labelValue
+				if nodeSet, exists := aggregatedTPUDevices.Load(combinedKey); exists {
+					//nodeSet = append(nodeSet.([]string), node.Name)
+					if _, nodeExists := nodeSet.(*sync.Map).Load(node.Name); !nodeExists {
+						nodeSet.Store(node.Name, true)
+					} else {
+						continue
+					}
+				} else {
+					nodeSet = &sync.Map{}
+					nodeSet.Store(node.Name, true)
+					aggregatedTPUDevices.Store(combinedKey, nodeSet)
+					deviceCount += 1
+				}
+			}
+		}
+	}
+
+	// need to figure out what to do when node devices dont exist
+	// if deviceCount == 0 {
+		
+	// }
+
+	devicesForPool := []resource.Device{}
+	allNodeNamesForSharedCapacity := make(map[string]struct{})
+
+	subsliceResourceSlice := &resource.ResourceSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: ClusterResourceSliceName,
+		},
+		Spec: resource.ResourceSliceSpec{
+			Pool: &resource.ResourcePool{
+				Name: ClusterResourceSliceName,
+				Generation: 1,
+				ResourceSliceCount: 1,
+			}
+			Driver: ControllerDriver,
+			PerDeviceNodeSelection: true,
+			SharedCounters: []resource.CounterSet{
+				Name: "slice-counter-set",
+				Counters: // map from name of nodes to counter struct with value 1, populated before
+			},
+			Devices: []resource.Device{ // list of devices, popoulated before
+
+			}
+	}
+
+	return aggregatedTPUDevices, nil
 }
